@@ -9,10 +9,11 @@ class HttpProtocolError(Exception):
 
 
 class NetworkError(Exception):
-	"""Ошибка сети (разрыв соединения, таймаут и т.п.) — обычно означает, что нужно переподключиться."""
+	"""Ошибка сети (разрыв соединения, таймаут) — обычно означает, что надо переподключиться."""
 
 
 MAX_HEADERS_SIZE = 64 * 1024
+SSE_DONE = b"[DONE]"
 
 
 async def aread_headers_block(reader: asyncio.StreamReader) -> bytes:
@@ -54,9 +55,22 @@ def get_header(headers: list[tuple[str, str]], name: str, default: Optional[str]
 
 
 def has_chunked_encoding(headers: list[tuple[str, str]]) -> bool:
-	value = get_header(headers, "Transfer-Encoding", "")
-	return "chunked" in value.lower()
+	return "chunked" in (get_header(headers, "Transfer-Encoding", "") or "").lower()
 
+
+def is_event_stream(headers: list[tuple[str, str]]) -> bool:
+	"""Content-Type: text/event-stream — тело является потоком Server-Sent Events."""
+	return "text/event-stream" in (get_header(headers, "Content-Type", "") or "").lower()
+
+
+def body_has_definite_length(headers: list[tuple[str, str]]) -> bool:
+	"""Можно ли понять конец тела, не дожидаясь закрытия соединения."""
+	if has_chunked_encoding(headers):
+		return True
+	return get_header(headers, "Content-Length") is not None
+
+
+# ---------------------------------------------------------------- чтение тела
 
 async def afread_content_length_body(reader: asyncio.StreamReader, length: int) -> AsyncIterator[bytes]:
 	remaining = length
@@ -102,13 +116,6 @@ async def afread_until_close(reader: asyncio.StreamReader) -> AsyncIterator[byte
 		yield chunk
 
 
-def body_has_definite_length(headers: list[tuple[str, str]]) -> bool:
-	"""Есть ли способ понять конец тела без закрытия соединения (chunked или Content-Length)."""
-	if has_chunked_encoding(headers):
-		return True
-	return get_header(headers, "Content-Length") is not None
-
-
 async def afread_body(
 	reader: asyncio.StreamReader,
 	headers: list[tuple[str, str]],
@@ -133,25 +140,60 @@ async def afread_body(
 	if allow_until_close:
 		async for chunk in afread_until_close(reader):
 			yield chunk
-		return
-	return  # тела нет
+	return
 
 
-async def afread_sse_events(byte_chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+# ---------------------------------------------------------------- SSE: разбор и сборка
+
+async def afdecode_sse(byte_chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
 	"""
-	Парсит Server-Sent Events поверх произвольного источника байт-чанков.
-	Событие отделяется пустой строкой. Поток завершается на 'data: [DONE]'.
+	Разбирает поток Server-Sent Events и отдаёт ЧИСТЫЕ полезные нагрузки сообщений:
+	префикс 'data:' снимается, многострочные data склеиваются через \\n,
+	терминатор '[DONE]' поглощается и наружу НЕ выдаётся (поток на нём просто заканчивается).
+
+	Внутри конвейера сообщения ходят без SSE-обвязки — обратно её навешивает тот,
+	кто отдаёт ответ клиенту (см. encode_sse_message / SSE_DONE).
 	"""
 	buffer = b""
 	async for chunk in byte_chunks:
 		buffer += chunk
 		while b"\n\n" in buffer:
-			event, buffer = buffer.split(b"\n\n", 1)
-			event = event.strip(b"\r\n")
-			if not event:
+			raw_event, buffer = buffer.split(b"\n\n", 1)
+			payload = _extract_sse_payload(raw_event)
+			if payload is None:
 				continue
-			yield event + b"\n\n"
-			if event.strip() in (b"data: [DONE]", b"data:[DONE]"):
+			if payload.strip() == SSE_DONE:
 				return
-	if buffer.strip():
-		yield buffer
+			yield payload
+	tail = _extract_sse_payload(buffer)
+	if tail is not None and tail.strip() != SSE_DONE:
+		yield tail
+
+
+def _extract_sse_payload(raw_event: bytes) -> Optional[bytes]:
+	"""Из блока SSE-события достаёт склеенные data-строки. None — если data в блоке нет."""
+	data_lines: list[bytes] = []
+	for line in raw_event.replace(b"\r\n", b"\n").split(b"\n"):
+		line = line.strip()
+		if not line or line.startswith(b":"):
+			continue  # пустая строка или комментарий
+		name, sep, value = line.partition(b":")
+		if not sep:
+			continue  # поле без значения (event, id и т.п. без двоеточия) — пропускаем
+		if name.strip().lower() != b"data":
+			continue  # event:, id:, retry: — для нашей задачи не нужны
+		data_lines.append(value[1:] if value.startswith(b" ") else value)
+	if not data_lines:
+		return None
+	return b"\n".join(data_lines)
+
+
+def encode_sse_message(payload: bytes) -> bytes:
+	"""Оборачивает чистую полезную нагрузку обратно в SSE-событие: 'data: ...\\n\\n'."""
+	lines = payload.replace(b"\r\n", b"\n").split(b"\n")
+	return b"".join(b"data: " + line + b"\n" for line in lines) + b"\n"
+
+
+def encode_sse_done() -> bytes:
+	"""Терминатор потока SSE."""
+	return b"data: " + SSE_DONE + b"\n\n"

@@ -3,8 +3,7 @@
 
 	python -m async_proxy.example_proxy
 
-Слушает 0.0.0.0:8000, форвардит все запросы на 127.0.0.1:8080,
-логируя каждый запрос/ответ через StreamLogger.
+Слушает 0.0.0.0:8000, форвардит запросы на 127.0.0.1:8080, логируя их через StreamLogger.
 """
 
 from __future__ import annotations

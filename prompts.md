@@ -61,3 +61,45 @@ Keep-alive к backend: одно TCP-соединение, переиспольз
 Как HttpBackend встраивается в конвейер: сам реализует Handler.ahandle (то есть это обычный элемент пайплайна, который форвардит запрос в backend), или это отдельный вспомогательный класс с другим API, который вызывается изнутри вашего Handler'а?
 HttpBackend сам реализует ahandle (Handler)
 
+-----------------------------------------------------------
+
+пара недочётов
+`ARequestInfo, ARespondInfo, _ABackendConnection, _areason_phrase` - это не awaitable объекты/типы, здесь буква A/a в начале не нужна
+SSE: afread_sse_events: из каждого сообщения надо убрать `data:` и `data: [DONE]` не надо пересылать
+HttpServer: должен анализировать заголовки ответа, и если там есть Content-Type:text/event-stream, то надо добавлять `data:` к сообщениям и data: `[DONE]` в конце
+
+И может быть client_addr стоит засунуть в RequestInfo, но это на твоё усмотрение
+
+Я тут подумал, формат
+
+async def ahandle(self, ..., afread_request, aresponse_start):
+    # analyze header
+    pump_task = asyncio.create_task(aresponse_start(headers, self.afread_respond))
+    async for chunk in afread_request():
+        ...
+    await pump_task # дожидаемся что все части ответа отправлены
+
+давай его назовём ahandle_duplex и будем его использовать если возникнет необходимость в стриминге запроса
+
+а пока будем использовать более простой формат
+
+async def ahandle(self, req_head, afreq_gen): # или можно прямо даные req_body:bytes вместо afreq_gen
+        ...
+    return resp_head, afresp_gen
+
+и использовать это
+
+resp_head, afresp_gen = await server.ahandle(req_head, req_body)
+отсылаем resp_head
+async for chunk in afresp_gen():
+    отсылаем chunk
+
+и соответственно всё перепишем
+
+
+Одно место, на которое стоит обратить внимание: 
+возвращённый afread_response держит за собой лок и соединение с backend, поэтому его обязательно надо проитерировать до конца или закрыть 
+— HttpServer делает это через finally: await body_gen.aclose(). 
+Освобождение ресурсов сидит в finally генератора, и оно строго синхронное: 
+await на пути GeneratorExit запрещён, поэтому фактическое закрытие сокета уводится в asyncio.create_task. 
+Проверил отдельным тестом — при резком обрыве клиента посреди стрима соединение к backend выбрасывается, лок освобождается, сервер продолжает работать.

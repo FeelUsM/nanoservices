@@ -1,102 +1,108 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 # Соглашение об именовании в проекте:
-#   async-методы/функции   -> начинаются с "a"  (например: ahandle, aresponse_start)
-#   async-генераторы       -> начинаются с "af" (например: afread_request)
-# Это сделано специально, чтобы не забывать про await/async for.
+#   async-функции/методы -> начинаются с "a"  (ahandle, aclose, aserve_forever)
+#   async-генераторы     -> начинаются с "af" (afread_response, afread_body)
+# Обычные типы, dataclass'ы и синхронные функции этих префиксов НЕ носят.
 
 AFReadChunk = Callable[[], AsyncIterator[bytes]]
 
 
 @dataclass
-class ARequestInfo:
+class RequestInfo:
 	method: str
 	path: str
 	http_version: str
 	headers: list[tuple[str, str]]
+	client_addr: Any = None
 
 
 @dataclass
-class AResponseInfo:
+class ResponseInfo:
 	status: int
-	reason: str
-	headers: list[tuple[str, str]]
-
-
-AResponseStart = Callable[[AResponseInfo, AFReadChunk], Awaitable[None]]
+	reason: str = ""
+	headers: list[tuple[str, str]] = field(default_factory=list)
 
 
 class Handler:
 	"""
 	Элемент конвейера "вопрос-ответ".
 
-	Архитектура симметрична: источник данных — генератор, потребитель делает async for.
-	Ошибка источника -> генератор кидает исключение, async for его ловит.
-	Ошибка потребителя -> async for кидает исключение внутрь генератора (GeneratorExit / что угодно
-	через agen.athrow), генератор может это поймать и подчистить ресурсы.
+	Основной (простой) контракт — тело запроса приходит целиком, ответ отдаётся стримом:
 
-	Если стриминг ответа должен идти параллельно со стримингом запроса — вызывающая сторона
-	оборачивает aresponse_start(...) в отдельную asyncio.Task и дожидается её после чтения запроса:
+		resp_head, afresp_gen = await handler.ahandle(req_head, req_body)
+		# отсылаем resp_head
+		async for chunk in afresp_gen():
+			# отсылаем chunk
 
-		pump_task = asyncio.create_task(aresponse_start(response, self.afread_respond))
-		async for chunk in afread_request():
-			...
-		await pump_task
+	Возвращённый генератор обязан быть проитерирован до конца (или закрыт через aclose()):
+	за ним могут стоять захваченные ресурсы — соединение с backend'ом, лок, файл.
 
-	Но в большинстве случаев (нет стриминга в запросе) это не нужно — можно сначала дочитать
-	запрос целиком, а затем один раз вызвать aresponse_start.
+	Архитектура симметрична: источник данных — async-генератор, потребитель делает async for.
+	Ошибка в источнике  -> генератор кидает исключение, async for его ловит.
+	Ошибка в приёмнике  -> async for обрывается, генератор получает GeneratorExit и подчищает за собой.
+
+	Для случая, когда стримить нужно и запрос тоже (клиент ещё шлёт тело, а сервер уже начал
+	отвечать), предусмотрен отдельный дуплексный контракт — ahandle_duplex, см. ниже.
 	"""
 
-	async def ahandle(
-		self,
-		request: ARequestInfo,
-		client_addr: Any,
-		afread_request: AFReadChunk,
-		aresponse_start: AResponseStart,
-	) -> None:
+	async def ahandle(self, request: RequestInfo, body: bytes) -> tuple[ResponseInfo, AFReadChunk]:
 		raise NotImplementedError
+
+	async def ahandle_duplex(
+		self,
+		request: RequestInfo,
+		afread_request: AFReadChunk,
+		aresponse_start: "AResponseStart",
+	) -> None:
+		"""
+		Дуплексный контракт — на будущее, когда понадобится стриминг запроса.
+		Ответ здесь начинается отдельной задачей, параллельно с чтением тела запроса:
+
+			pump_task = asyncio.create_task(aresponse_start(resp_head, self.afread_respond))
+			async for chunk in afread_request():
+				...
+			await pump_task  # дожидаемся, что все части ответа отправлены
+
+		Пока не используется — реализация по умолчанию отсутствует.
+		"""
+		raise NotImplementedError("дуплексный режим пока не реализован")
+
+
+AResponseStart = Callable[[ResponseInfo, AFReadChunk], Awaitable[None]]
 
 
 class StreamLogger(Handler):
 	"""
-	Пример элемента конвейера: прозрачно логирует запрос/ответ и передаёт управление дальше.
-	Показывает, как оборачивать afread_request/aresponse_start, не трогая сами данные.
+	Пример элемента конвейера: прозрачно логирует запрос и ответ, данных не меняет.
+	Показывает, как оборачивать возвращаемый генератор, не ломая стриминг.
 	"""
 
 	def __init__(self, next_handler: Handler, *, log: Callable[[str], None] = print) -> None:
 		self._next = next_handler
 		self._log = log
 
-	async def ahandle(
-		self,
-		request: ARequestInfo,
-		client_addr: Any,
-		afread_request: AFReadChunk,
-		aresponse_start: AResponseStart,
-	) -> None:
-		self._log(f"[{client_addr}] -> {request.method} {request.path}")
+	async def ahandle(self, request: RequestInfo, body: bytes) -> tuple[ResponseInfo, AFReadChunk]:
+		self._log(f"[{request.client_addr}] -> {request.method} {request.path} ({len(body)} байт тела)")
 
-		async def afread_request_logged() -> AsyncIterator[bytes]:
+		response, afread_response = await self._next.ahandle(request, body)
+		self._log(f"[{request.client_addr}] <- {response.status} {response.reason}")
+
+		async def afread_response_logged() -> AsyncIterator[bytes]:
 			total = 0
-			async for chunk in afread_request():
-				total += len(chunk)
-				yield chunk
-			if total:
-				self._log(f"[{client_addr}] тело запроса: {total} байт")
-
-		async def aresponse_start_logged(response: AResponseInfo, afread_response: AFReadChunk) -> None:
-			self._log(f"[{client_addr}] <- {response.status} {response.reason}")
-
-			async def afread_response_logged() -> AsyncIterator[bytes]:
-				total = 0
+			count = 0
+			try:
 				async for chunk in afread_response():
 					total += len(chunk)
+					count += 1
 					yield chunk
-				self._log(f"[{client_addr}] тело ответа: {total} байт")
+			except Exception as exc:
+				self._log(f"[{request.client_addr}] !! ошибка в теле ответа после {total} байт: {exc!r}")
+				raise
+			finally:
+				self._log(f"[{request.client_addr}] тело ответа: {total} байт в {count} частях")
 
-			await aresponse_start(response, afread_response_logged)
-
-		await self._next.ahandle(request, client_addr, afread_request_logged, aresponse_start_logged)
+		return response, afread_response_logged
