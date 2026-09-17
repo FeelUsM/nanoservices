@@ -1,0 +1,6 @@
+[project]
+name = "nanoservices"
+version = "0.1.0"
+description = "classes as http microservices"
+requires-python = ">=3.12"
+dependencies = ["pyyaml"]

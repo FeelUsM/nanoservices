@@ -95,10 +95,14 @@ async def afread_chunked_body(reader: asyncio.StreamReader) -> AsyncIterator[byt
 		except ValueError as exc:
 			raise HttpProtocolError(f"некорректный размер chunk: {size_line!r}") from exc
 		if size == 0:
+			# last-chunk: дочитываем trailer-section до пустой строки
 			try:
-				await reader.readuntil(b"\r\n\r\n")
-			except asyncio.IncompleteReadError:
-				pass
+				while True:
+					line = await reader.readuntil(b"\r\n")
+					if line == b"\r\n":
+						break
+			except asyncio.IncompleteReadError as exc:
+				raise NetworkError("соединение закрылось посреди chunked-тела") from exc
 			return
 		try:
 			data = await reader.readexactly(size)
@@ -150,21 +154,33 @@ async def afdecode_sse(byte_chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes
 	Разбирает поток Server-Sent Events и отдаёт ЧИСТЫЕ полезные нагрузки сообщений:
 	префикс 'data:' снимается, многострочные data склеиваются через \\n,
 	терминатор '[DONE]' поглощается и наружу НЕ выдаётся (поток на нём просто заканчивается).
+	Концы строк CRLF/CR нормализуются в LF, т.ч. события детектятся по ходу стрима.
 
 	Внутри конвейера сообщения ходят без SSE-обвязки — обратно её навешивает тот,
 	кто отдаёт ответ клиенту (см. encode_sse_message / SSE_DONE).
 	"""
 	buffer = b""
-	async for chunk in byte_chunks:
-		buffer += chunk
-		while b"\n\n" in buffer:
-			raw_event, buffer = buffer.split(b"\n\n", 1)
-			payload = _extract_sse_payload(raw_event)
-			if payload is None:
-				continue
-			if payload.strip() == SSE_DONE:
-				return
-			yield payload
+	source = byte_chunks.__aiter__()
+	try:
+		while True:
+			try:
+				chunk = await source.__anext__()
+			except StopAsyncIteration:
+				break
+			# нормализуем концы строк до \n: backend'ы шлют и LF, и CRLF
+			buffer += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+			while b"\n\n" in buffer:
+				raw_event, buffer = buffer.split(b"\n\n", 1)
+				payload = _extract_sse_payload(raw_event)
+				if payload is None:
+					continue
+				if payload.strip() == SSE_DONE:
+					return
+				yield payload
+	finally:
+		aclose = getattr(source, "aclose", None)
+		if aclose is not None:
+			await aclose()
 	tail = _extract_sse_payload(buffer)
 	if tail is not None and tail.strip() != SSE_DONE:
 		yield tail

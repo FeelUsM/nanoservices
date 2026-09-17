@@ -52,10 +52,10 @@ class HttpServer:
 	в 'data: ...\\n\\n', а в конце дописывается 'data: [DONE]\\n\\n'.
 	"""
 
-	def __init__(self, host: str, port: int, handler: Handler) -> None:
+	def __init__(self, pipeline: Handler, host: str = "0.0.0.0", port: int = 8000) -> None:
 		self._host = host
 		self._port = port
-		self._handler = handler
+		self._handler = pipeline
 		self._server: Optional[asyncio.AbstractServer] = None
 
 	async def astart(self) -> None:

@@ -4,6 +4,7 @@ import asyncio
 import ssl
 import time
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlsplit
 
 from .http_common import (
 	HttpProtocolError,
@@ -38,38 +39,72 @@ class _BackendConnection:
 			pass
 
 
+def parse_target_url(url: str) -> tuple[str, int, bool, str, str, int]:
+	"""URL backend'а -> (host, port, use_ssl, base_path, base_query, default_port)."""
+	parts = urlsplit(url)
+	if parts.scheme not in ("http", "https"):
+		raise ValueError(f"поддерживаются только схемы http/https: {url!r}")
+	if not parts.hostname:
+		raise ValueError(f"в URL нет хоста: {url!r}")
+	use_ssl = parts.scheme == "https"
+	default_port = 443 if use_ssl else 80
+	return (
+		parts.hostname,
+		parts.port or default_port,
+		use_ssl,
+		parts.path.rstrip("/") if parts.path else "",
+		parts.query,
+		default_port,
+	)
+
+
 class HttpBackend(Handler):
 	"""
 	Handler, форвардящий запрос в реальный HTTP backend.
 
-	Создание экземпляра соединений не открывает — они поднимаются лениво, при первом запросе
-	от конкретного client_addr. На каждого клиента фронтенда держится одно keep-alive
-	соединение до backend'а; если backend незаметно закрыл протухшее соединение, HttpBackend
-	один раз прозрачно переподключается и повторяет запрос.
-
-	Стриминг поддержан на стороне ответа: заголовки возвращаются сразу, тело отдаётся
-	генератором по мере поступления. Если backend ответил Content-Type: text/event-stream,
-	тело разбирается как SSE и наружу идут ЧИСТЫЕ полезные нагрузки сообщений (без 'data:',
-	без терминатора '[DONE]') — обвязку обратно навесит тот, кто отдаёт ответ клиенту.
-
-	Возвращённый генератор тела обязан быть проитерирован до конца или закрыт: пока он живёт,
+ 	Создание экземпляра соединений не открывает — они поднимаются лениво, при первом запросе
+ 	от конкретного client_addr. На каждого клиента фронтенда держится одно keep-alive
+ 	соединение до backend'а; если backend незаметно закрыл протухшее соединение, HttpBackend
+ 	один раз прозрачно переподключается и повторяет запрос.
+	Адрес backend'а задаётся URL: схема http/https, хост, порт (по умолчанию 80/443)
+	и необязательный префикс пути, который приклеивается перед путём запроса.
+ 
+ 	Стриминг поддержан на стороне ответа: заголовки возвращаются сразу, тело отдаётся
+ 	генератором по мере поступления. Если backend ответил Content-Type: text/event-stream,
+ 	тело разбирается как SSE и наружу идут ЧИСТЫЕ полезные нагрузки сообщений (без 'data:',
+ 	без терминатора '[DONE]') — обвязку обратно навесит тот, кто отдаёт ответ клиенту.
+ 
+ 	Возвращённый генератор тела обязан быть проитерирован до конца или закрыт: пока он живёт,
 	за ним держатся лок и соединение с backend'ом.
 	"""
 
 	def __init__(
 		self,
-		target_host: str,
-		target_port: int,
+		url: str,
 		*,
 		ssl_ctx: Optional[ssl.SSLContext] = None,
 		connect_timeout: float = 10.0,
 	) -> None:
-		self._target_host = target_host
-		self._target_port = target_port
-		self._ssl_ctx = ssl_ctx
+		host, port, use_ssl, base_path, base_query, default_port = parse_target_url(url)
+		if ssl_ctx is None and use_ssl:
+			ssl_ctx = ssl.create_default_context()
+		self._target_host = host
+		self._target_port = port
+		self._ssl_ctx: Optional[ssl.SSLContext] = ssl_ctx if use_ssl else None
+		self._base_path = base_path
+		self._base_query = base_query
+		self._host_header = host if port == default_port else f"{host}:{port}"
 		self._connect_timeout = connect_timeout
 		self._connections: dict[Any, _BackendConnection] = {}
 		self._connections_guard = asyncio.Lock()
+
+	def _target_path(self, request_path: str) -> str:
+		req_path, _, req_query = request_path.partition("?")
+		full = f"{self._base_path}{req_path}"
+		query = req_query
+		if self._base_query:
+			query = f"{self._base_query}&{req_query}" if req_query else self._base_query
+		return f"{full}?{query}" if query else full
 
 	# ------------------------------------------------------------------ соединения
 
@@ -107,11 +142,11 @@ class HttpBackend(Handler):
 
 	async def _awrite_request(self, conn: _BackendConnection, request: RequestInfo, body: bytes) -> None:
 		skip = {"content-length", "connection", "host", "transfer-encoding"}
-		lines = [f"{request.method} {request.path} HTTP/1.1"]
+		lines = [f"{request.method} {self._target_path(request.path)} HTTP/1.1"]
 		for name, value in request.headers:
 			if name.lower() not in skip:
 				lines.append(f"{name}: {value}")
-		lines.append(f"Host: {self._target_host}")
+		lines.append(f"Host: {self._host_header}")
 		lines.append(f"Content-Length: {len(body)}")
 		lines.append("Connection: keep-alive")
 		head = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
@@ -193,6 +228,9 @@ class HttpBackend(Handler):
 				state["reusable"] = False
 				raise
 			finally:
+				aclose = getattr(byte_source, "aclose", None)
+				if aclose is not None:
+					await aclose()
 				release(drop=not state["reusable"])
 
 		return response, afread_response
