@@ -26,6 +26,9 @@ async def aread_headers_block(reader: asyncio.StreamReader) -> bytes:
 		raise NetworkError("соединение оборвалось посреди заголовков") from exc
 	except asyncio.LimitOverrunError as exc:
 		raise HttpProtocolError("заголовки превышают допустимый размер буфера") from exc
+	except (ConnectionError, OSError) as exc:
+		# обрыв/таймаут/сброс на уровне TCP/TLS — это сеть, а не протокол
+		raise NetworkError(f"соединение оборвалось при чтении заголовков: {exc}") from exc
 	if len(data) > MAX_HEADERS_SIZE:
 		raise HttpProtocolError("заголовки превышают допустимый размер")
 	return data
@@ -75,7 +78,10 @@ def body_has_definite_length(headers: list[tuple[str, str]]) -> bool:
 async def afread_content_length_body(reader: asyncio.StreamReader, length: int) -> AsyncIterator[bytes]:
 	remaining = length
 	while remaining > 0:
-		chunk = await reader.read(min(65536, remaining))
+		try:
+			chunk = await reader.read(min(65536, remaining))
+		except (ConnectionError, OSError) as exc:
+			raise NetworkError(f"соединение оборвалось посреди тела: {exc}") from exc
 		if not chunk:
 			raise NetworkError("соединение закрылось раньше, чем пришло тело ожидаемой длины")
 		remaining -= len(chunk)
@@ -89,6 +95,10 @@ async def afread_chunked_body(reader: asyncio.StreamReader) -> AsyncIterator[byt
 			size_line = await reader.readuntil(b"\r\n")
 		except asyncio.IncompleteReadError as exc:
 			raise NetworkError("соединение закрылось посреди chunked-тела") from exc
+		except asyncio.LimitOverrunError as exc:
+			raise HttpProtocolError(f"строка размера chunk превышает буфер: {exc}") from exc
+		except (ConnectionError, OSError) as exc:
+			raise NetworkError(f"соединение оборвалось посреди chunked-тела: {exc}") from exc
 		size_str = size_line.strip().split(b";")[0]
 		try:
 			size = int(size_str, 16)
@@ -103,18 +113,27 @@ async def afread_chunked_body(reader: asyncio.StreamReader) -> AsyncIterator[byt
 						break
 			except asyncio.IncompleteReadError as exc:
 				raise NetworkError("соединение закрылось посреди chunked-тела") from exc
+			except asyncio.LimitOverrunError as exc:
+				raise HttpProtocolError(f"трейлер chunked-тела превышает буфер: {exc}") from exc
+			except (ConnectionError, OSError) as exc:
+				raise NetworkError(f"соединение оборвалось посреди chunked-тела: {exc}") from exc
 			return
 		try:
 			data = await reader.readexactly(size)
 			await reader.readexactly(2)  # завершающий CRLF после данных chunk'а
 		except asyncio.IncompleteReadError as exc:
 			raise NetworkError("соединение закрылось посреди chunked-тела") from exc
+		except (ConnectionError, OSError) as exc:
+			raise NetworkError(f"соединение оборвалось посреди chunked-тела: {exc}") from exc
 		yield data
 
 
 async def afread_until_close(reader: asyncio.StreamReader) -> AsyncIterator[bytes]:
 	while True:
-		chunk = await reader.read(65536)
+		try:
+			chunk = await reader.read(65536)
+		except (ConnectionError, OSError) as exc:
+			raise NetworkError(f"соединение оборвалось при чтении до закрытия: {exc}") from exc
 		if not chunk:
 			return
 		yield chunk
@@ -158,6 +177,9 @@ async def afdecode_sse(byte_chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes
 
 	Внутри конвейера сообщения ходят без SSE-обвязки — обратно её навешивает тот,
 	кто отдаёт ответ клиенту (см. encode_sse_message / SSE_DONE).
+
+	Классификация ошибок (методика): обрыв транспорта — NetworkError,
+	нарушение формата SSE — HttpProtocolError.
 	"""
 	buffer = b""
 	source = byte_chunks.__aiter__()
@@ -167,6 +189,12 @@ async def afdecode_sse(byte_chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes
 				chunk = await source.__anext__()
 			except StopAsyncIteration:
 				break
+			except (NetworkError, HttpProtocolError):
+				raise
+			except (ConnectionError, OSError) as exc:
+				raise NetworkError(f"SSE-стрим оборвался: {exc}") from exc
+			except Exception as exc:
+				raise HttpProtocolError(f"некорректный SSE-стрим: {exc}") from exc
 			# нормализуем концы строк до \n: backend'ы шлют и LF, и CRLF
 			buffer += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
 			while b"\n\n" in buffer:

@@ -4,3 +4,17 @@ version = "0.1.0"
 description = "classes as http microservices"
 requires-python = ">=3.12"
 dependencies = ["pyyaml"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# Раскладка нестандартная: корень репозитория сам является пакетом
+# (__init__.py рядом с pyproject.toml). Без явного маппинга автообнаружение
+# setuptools пакет не видит (в установку уезжает только мусор вроде back/),
+# и import nanoservices падает несмотря на успешный pip install -e .
+[tool.setuptools]
+packages = ["nanoservices"]
+
+[tool.setuptools.package-dir]
+nanoservices = "."

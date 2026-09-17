@@ -83,7 +83,7 @@ class HttpServer:
 		except NetworkError:
 			pass  # клиент оборвал соединение — штатная ситуация
 		except Exception:
-			_LOG.exception("[%s] необработанная ошибка на соединении", client_addr)
+			_LOG.exception("HttpServer: [%s] необработанная ошибка на соединении", client_addr)
 		finally:
 			writer.close()
 			try:
@@ -122,11 +122,23 @@ class HttpServer:
 		try:
 			response, afread_response = await self._handler.ahandle(request, body)
 		except (NetworkError, HttpProtocolError) as exc:
-			_LOG.warning("[%s] backend недоступен: %s", client_addr, exc)
+			_LOG.warning("HttpServer: [%s] backend недоступен: %s", client_addr, exc)
+			await self._awrite_error(writer, 502, keep_alive=False)
+			return False
+		except (asyncio.TimeoutError, TimeoutError) as exc:
+			# сырой таймаут от чужого handler'а (свой backend заворачивает в NetworkError):
+			# как положено прокси — 504, а не 500
+			_LOG.warning("HttpServer: [%s] backend не ответил вовремя: %s", client_addr, exc)
+			await self._awrite_error(writer, 504, keep_alive=False)
+			return False
+		except OSError as exc:
+			# сырая сетевая ошибка от чужого handler'а, миновавшая заворот
+			# в NetworkError: тоже вины клиента нет — 502, а не 500
+			_LOG.warning("HttpServer: [%s] backend недоступен: %s", client_addr, exc)
 			await self._awrite_error(writer, 502, keep_alive=False)
 			return False
 		except Exception:
-			_LOG.exception("[%s] ошибка в конвейере", client_addr)
+			_LOG.exception("HttpServer: [%s] ошибка в конвейере", client_addr)
 			await self._awrite_error(writer, 500, keep_alive=False)
 			return False
 
@@ -135,7 +147,7 @@ class HttpServer:
 		except NetworkError:
 			raise  # клиент отвалился — соединение закрывает вызывающий
 		except (HttpProtocolError, OSError) as exc:
-			_LOG.warning("[%s] ошибка при передаче тела ответа: %s", client_addr, exc)
+			_LOG.warning("HttpServer: [%s] ошибка при передаче тела ответа: %s", client_addr, exc)
 			return False
 
 		return keep_alive

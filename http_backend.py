@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import ssl
 import time
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 from urllib.parse import urlsplit
 
 from .http_common import (
@@ -84,6 +84,7 @@ class HttpBackend(Handler):
 		*,
 		ssl_ctx: Optional[ssl.SSLContext] = None,
 		connect_timeout: float = 10.0,
+		log: Optional[Callable[[str], None]] = None,
 	) -> None:
 		host, port, use_ssl, base_path, base_query, default_port = parse_target_url(url)
 		if ssl_ctx is None and use_ssl:
@@ -95,6 +96,7 @@ class HttpBackend(Handler):
 		self._base_query = base_query
 		self._host_header = host if port == default_port else f"{host}:{port}"
 		self._connect_timeout = connect_timeout
+		self._log = log
 		self._connections: dict[Any, _BackendConnection] = {}
 		self._connections_guard = asyncio.Lock()
 
@@ -109,10 +111,24 @@ class HttpBackend(Handler):
 	# ------------------------------------------------------------------ соединения
 
 	async def _aopen_connection(self) -> _BackendConnection:
-		reader, writer = await asyncio.wait_for(
-			asyncio.open_connection(self._target_host, self._target_port, ssl=self._ssl_ctx),
-			timeout=self._connect_timeout,
-		)
+		# Правило прокси: любая ошибка установки соединения с backend'ом — это сеть
+		# (NetworkError → 502/504 у сервера), а не внутренняя ошибка (→ 500).
+		# CancelledError/KeyboardInterrupt не ловим — им дают всплыть.
+		try:
+			reader, writer = await asyncio.wait_for(
+				asyncio.open_connection(self._target_host, self._target_port, ssl=self._ssl_ctx),
+				timeout=self._connect_timeout,
+			)
+		except (asyncio.TimeoutError, TimeoutError) as exc:
+			raise NetworkError(
+				f"таймаут подключения к backend {self._target_host}:{self._target_port}: {exc}"
+			) from exc
+		except (ConnectionError, OSError) as exc:
+			# сюда же попадают сброс при TLS-handshake (ConnectionResetError),
+			# ssl.SSLError/CertificateError (подклассы OSError) и ошибки DNS (gaierror)
+			raise NetworkError(
+				f"не удалось подключиться к backend {self._target_host}:{self._target_port}: {exc}"
+			) from exc
 		return _BackendConnection(reader, writer)
 
 	async def _aget_connection(self, client_addr: Any) -> _BackendConnection:
@@ -191,8 +207,10 @@ class HttpBackend(Handler):
 		try:
 			try:
 				response, byte_source, reusable = await self._aexchange(conn, request, body)
-			except NetworkError:
+			except NetworkError as exc:
 				# backend тихо закрыл протухшее keep-alive соединение — переподключаемся один раз
+				if self._log is not None:
+					self._log(f"HttpBackend: переподключение к {self._target_host}:{self._target_port} после {exc!r}")
 				await self._adrop_connection(client_addr, conn)
 				conn.lock.release()
 				conn = await self._aget_connection(client_addr)
@@ -220,8 +238,12 @@ class HttpBackend(Handler):
 			try:
 				async for chunk in byte_source:
 					yield chunk
-			except (NetworkError, HttpProtocolError):
+			except (NetworkError, HttpProtocolError, OSError) as exc:
+				# Любой обрыв (включая сырой OSError, если он каким-то путём
+				# миновал заворот в http_common) делает соединение непригодным.
 				state["reusable"] = False
+				if isinstance(exc, OSError):
+					raise NetworkError(f"backend оборвал тело ответа: {exc}") from exc
 				raise
 			except GeneratorExit:
 				# потребитель оборвал чтение на середине — соединение уже не в консистентном состоянии

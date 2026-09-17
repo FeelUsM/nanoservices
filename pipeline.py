@@ -26,6 +26,14 @@ from .http_common import get_header
 AFReadChunk = Callable[[], AsyncIterator[bytes]]
 
 
+class LogError(Exception):
+	"""Ошибка самого файлового логгера (диск/права/путь).
+
+	Внутренняя ошибка конвейера: сервер маппит её в 500, а не в 502 —
+	вины backend'а здесь нет. В консоль такие ошибки подсвечиваются ярко.
+	"""
+
+
 @dataclass
 class RequestInfo:
 	method: str
@@ -119,16 +127,29 @@ class StreamLogger(Handler):
 		self._dir = Path(dir)
 		self._max_files = max_files
 		self._log = log
-		self._dir.mkdir(parents=True, exist_ok=True)
+		try:
+			self._dir.mkdir(parents=True, exist_ok=True)
+		except OSError as exc:
+			self._log(f"StreamLogger: \x1b[31;1m!!! НЕ МОГУ СОЗДАТЬ ПАПКУ ЛОГОВ {self._dir}: {exc!r}\x1b[0m")
+			raise LogError(f"не удалось создать папку логов {self._dir}: {exc}") from exc
+
+	def _alog_bright(self, message: str) -> None:
+		# Яркая подсветка в консоли: имя класса — в самом начале строки
+		# (до ANSI-кодов), чтобы работал и startswith, и визуальный поиск.
+		self._log(f"StreamLogger: \x1b[31;1m{message}\x1b[0m")
 
 	def _new_log_path(self, date_part: str, host: str, port: str) -> Path:
-		base = f"{date_part}-{host}-{port}"
-		path = self._dir / f"{base}.txt"
-		n = 0
-		while path.exists():
-			n += 1
-			path = self._dir / f"{base}-{n}.txt"
-		path.touch()
+		try:
+			base = f"{date_part}-{host}-{port}"
+			path = self._dir / f"{base}.txt"
+			n = 0
+			while path.exists():
+				n += 1
+				path = self._dir / f"{base}-{n}.txt"
+			path.touch()
+		except OSError as exc:
+			self._alog_bright(f"!!! НЕ МОГУ СОЗДАТЬ ФАЙЛ ЛОГА в {self._dir}: {exc!r}")
+			raise LogError(f"не удалось создать файл лога в {self._dir}: {exc}") from exc
 		self._rotate(keep=path)
 		return path
 
@@ -159,12 +180,26 @@ class StreamLogger(Handler):
 
 		def emit(text: str) -> None:
 			# файл не держим открытым: генератор могут так и не проитерировать,
-			# а синхронная запись безопасна и на пути GeneratorExit
-			with open(path, "a", encoding="utf-8") as fh:
-				fh.write(text)
+			# а синхронная запись безопасна и на пути GeneratorExit.
+			# Ошибки записи ярко подсвечиваем в консоли и заворачиваем в LogError,
+			# чтобы сервер вернул 500 (вина диска, а не backend'а).
+			try:
+				with open(path, "a", encoding="utf-8") as fh:
+					fh.write(text)
+			except OSError as exc:
+				self._alog_bright(f"!!! ОШИБКА ЗАПИСИ ЛОГА {path}: {exc!r}")
+				raise LogError(f"не удалось записать лог {path}: {exc}") from exc
 
 		def sep(message: str) -> None:
 			emit(f"==== {os.urandom(10).hex()} {message} ====\n")
+
+		def safe_sep(message: str) -> None:
+			# sep в обработчике чужой ошибки: если умер и сам лог, исходная
+			# ошибка важнее — ярко уже подсветили внутри emit, не маскируем.
+			try:
+				sep(message)
+			except LogError:
+				pass
 
 		req_json = _is_json_content(request.headers, "Content-Type")
 		sep("")
@@ -172,13 +207,13 @@ class StreamLogger(Handler):
 		for name, value in request.headers:
 			emit(f"{name}: {value}\n")
 		emit(f"\n{_format_logged_data(body, is_json=req_json)}\n")
-		self._log(f"[{tag}] -> {request.method} {request.path} ({len(body)} байт тела)")
+		self._log(f"StreamLogger: [{tag}] -> {request.method} {request.path} ({len(body)} байт тела)")
 
 		try:
 			response, afread_response = await self._next.ahandle(request, body)
 		except Exception as exc:
-			sep(f"ERROR {exc!r}")
-			self._log(f"[{tag}] !! ошибка конвейера: {exc!r}")
+			safe_sep(f"ERROR {exc!r}")
+			self._log(f"StreamLogger: [{tag}] !! ошибка конвейера: {exc!r}")
 			raise
 
 		resp_json = _is_json_content(response.headers, "Content-Type") or _is_json_content(
@@ -210,21 +245,21 @@ class StreamLogger(Handler):
 					emit(f"{_format_logged_data(chunk, is_json=resp_json)}\n")
 					yield chunk
 			except GeneratorExit:
-				sep("ABORT")
+				safe_sep("ABORT")
 				raise
 			except Exception as exc:
-				sep(f"ERROR {exc!r}")
-				self._log(f"[{tag}] !! ошибка в теле ответа после {total} байт: {exc!r}")
+				safe_sep(f"ERROR {exc!r}")
+				self._log(f"StreamLogger: [{tag}] !! ошибка в теле ответа после {total} байт: {exc!r}")
 				raise
 			else:
-				sep("END")
+				safe_sep("END")
 			finally:
 				# детерминированно закрываем внутренний генератор: await здесь легален
 				# (запрещён только yield на пути GeneratorExit), брошенный внутрь
 				# GeneratorExit заставит источник освободить свои ресурсы сразу,
 				# а не через финализатор цикла
 				await inner.aclose()
-				self._log(f"[{tag}] <- {response.status} {response.reason} ({total} байт в {count} частях)")
+				self._log(f"StreamLogger: [{tag}] <- {response.status} {response.reason} ({total} байт в {count} частях)")
 
 		return response, afread_response_logged
 
@@ -317,11 +352,16 @@ def _format_logged_data(data: bytes, *, is_json: bool) -> str:
 		return _pack_json_lines(
 			json.dumps(parsed, ensure_ascii=False, indent=1), StreamLogger._LOG_WIDTH
 		)
-	return "YAML\n" + yaml.dump(
-		parsed,
-		Dumper=_LiteralDumper,
-		allow_unicode=True,
-		default_flow_style=False,
-		sort_keys=False,
-		width=StreamLogger._LOG_WIDTH,
-	).rstrip("\n")
+	try:
+		rendered = yaml.dump(
+			parsed,
+			Dumper=_LiteralDumper,
+			allow_unicode=True,
+			default_flow_style=False,
+			sort_keys=False,
+			width=StreamLogger._LOG_WIDTH,
+		).rstrip("\n")
+	except Exception:
+		# логгер никогда не роняет запрос из-за форматирования — отдаём как есть
+		return text
+	return "YAML\n" + rendered

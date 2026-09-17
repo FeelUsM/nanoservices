@@ -5,6 +5,9 @@
 - Импорты относительные (`from .http_backend import ...`), поэтому запуск только как пакет из родителя: `python3 -m nanoservices.example_proxy --url http://127.0.0.1:8080 --dir log --host 0.0.0.0 --port 8000`.
 - `prompts.md` — история проектирования, а не описание текущего API. Текущие сигнатуры смотреть в коде.
 
+## Установка (`pip install -e .`)
+- В `pyproject.toml` обязательны `[build-system]` + явный маппинг `[tool.setuptools] packages = ["nanoservices"]` с `[tool.setuptools.package-dir] nanoservices = "."`: корень репозитория сам является пакетом, без этого автообнаружение setuptools пакет не видит (в установку уезжает только мусор вроде `back/`, а `import nanoservices` падает — было, чинилось). После правок упаковки проверять из нейтральной папки: `python -c "import nanoservices.pipeline, nanoservices.http_backend, nanoservices.http_server"` и `python -m nanoservices.example_proxy --help`.
+
 ## Тесты
 - Раннер — stdlib `unittest`, других зависимостей нет. Из корня репозитория: `python3 -m unittest discover -s tests -v` (в файлах есть bootstrap `sys.path`, снаружи пакета тоже работает).
 - Методы тестов называются `test_*` — требование discovery, здесь исключение из правила префиксов `a`/`af`.
@@ -56,3 +59,14 @@
 - Порядок чтения тела: `chunked` → `Content-Length` → `until-close` только при `allow_until_close`. Кодировка заголовков `iso-8859-1`.
 - Конец chunked-тела — строки до первой пустой (трейлеры поддерживаются). `readuntil(b"\r\n\r\n")` после `0\r\n` делать нельзя: без трейлеров там всего 2 байта, чтение виснет навсегда.
 - `afdecode_sse` нормализует CRLF/CR в LF до разбивки на события, иначе CRLF-стримы отдаются одним куском в конце.
+
+## Ошибки и их обработка (методика)
+- Три класса ошибок: сеть → `NetworkError`, протокол → `HttpProtocolError`, всё остальное (баги, диск, `LogError`, `ValueError`, `NotImplementedError`) → внутренняя ошибка.
+- Заворот сырых исключений — на границе чтения/коннекта, как в правильных прокси: `(ConnectionError, OSError)` (включая `ConnectionResetError` при TLS-handshake, `ssl.SSLError`, `gaierror`, таймауты `wait_for`) → `NetworkError`; `LimitOverrunError`/oversize → `HttpProtocolError`. Сырой `OSError`/`TimeoutError` от чужого handler'а сервер тоже маппит в `502`/`504`, а не в `500`.
+- SSE-разбор — это формат: обрыв транспорта внутри `afdecode_sse` → `NetworkError`, нарушение формата → `HttpProtocolError`.
+- `HttpServer`: `NetworkError`/`HttpProtocolError`/сырой `OSError` → `502`, сырой `TimeoutError` → `504`, прочее → `500`. Ошибки чтения запроса от клиента — вне маппинга в статус: `NetworkError` → silent, остальное → лог без ответа.
+- `HttpBackend`: одна прозрачная переподключалка при `NetworkError` на протухшем keep-alive; ошибки `_aopen_connection` сразу в `NetworkError` без ретрая вслепую. Любой обрыв тела ответа (включая сырой `OSError`) → `reusable=False`/`drop`, битое соединение в пул не возвращается.
+- `StreamLogger` тип ошибки не меняет (транзит для `502`/`500`), файловые ошибки (`mkdir`/`touch`/`emit`) ярко подсвечивает в консоли красным (`!!! ...`, ANSI) и заворачивает в `LogError` → `500`. `sep` в обработчике чужой ошибки — через `safe_sep`, чтобы смерть диска не маскировала исходную ошибку. Сбой форматирования (`yaml.dump`) никогда не роняет запрос — отдаём тело как есть.
+- `KeyboardInterrupt`/`CancelledError` (`BaseException`) не ловим и не заворачиваем нигде — им дают всплыть. `except Exception` их не глотает.
+- Консоль: каждая строка, которую компонент выводит в консоль, начинается с имени его класса (`StreamLogger: ...`, `HttpServer: ...`, `HttpBackend: ...`). У `StreamLogger` имя стоит до ANSI-кодов подсветки, чтобы работал `startswith`.
+- Импорты внутри пакета — только относительные (`from .http_common import ...`): абсолютные создают второй модуль-двойник, и `NetworkError` из разных модулей перестаёт ловиться `except` (было: `502` превращались в `500`).
