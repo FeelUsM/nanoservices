@@ -83,7 +83,7 @@ class HttpBackend(Handler):
 		url: str,
 		*,
 		ssl_ctx: Optional[ssl.SSLContext] = None,
-		connect_timeout: float = 10.0,
+		connect_timeout: Optional[float] = None,
 		log: Optional[Callable[[str], None]] = None,
 	) -> None:
 		host, port, use_ssl, base_path, base_query, default_port = parse_target_url(url)
@@ -111,18 +111,27 @@ class HttpBackend(Handler):
 	# ------------------------------------------------------------------ соединения
 
 	async def _aopen_connection(self) -> _BackendConnection:
-		# Правило прокси: любая ошибка установки соединения с backend'ом — это сеть
-		# (NetworkError → 502/504 у сервера), а не внутренняя ошибка (→ 500).
+		# Таймаутов со стороны прокси нет: прерывать или нет — решает клиент
+		# (разрывом своего соединения). connect_timeout оставлен только как опция
+		# на крайний случай, по умолчанию None = ждать бесконечно, пока жив клиент.
 		# CancelledError/KeyboardInterrupt не ловим — им дают всплыть.
 		try:
-			reader, writer = await asyncio.wait_for(
-				asyncio.open_connection(self._target_host, self._target_port, ssl=self._ssl_ctx),
-				timeout=self._connect_timeout,
-			)
-		except (asyncio.TimeoutError, TimeoutError) as exc:
-			raise NetworkError(
-				f"таймаут подключения к backend {self._target_host}:{self._target_port}: {exc}"
-			) from exc
+			if self._connect_timeout is None:
+				reader, writer = await asyncio.open_connection(
+					self._target_host, self._target_port, ssl=self._ssl_ctx
+				)
+			else:
+				try:
+					reader, writer = await asyncio.wait_for(
+						asyncio.open_connection(self._target_host, self._target_port, ssl=self._ssl_ctx),
+						timeout=self._connect_timeout,
+					)
+				except (asyncio.TimeoutError, TimeoutError) as exc:
+					# у TimeoutError пустой str(exc), поэтому подставляем сам лимит
+					raise NetworkError(
+						f"таймаут подключения к backend {self._target_host}:{self._target_port}"
+						f" за {self._connect_timeout}с"
+					) from exc
 		except (ConnectionError, OSError) as exc:
 			# сюда же попадают сброс при TLS-handshake (ConnectionResetError),
 			# ssl.SSLError/CertificateError (подклассы OSError) и ошибки DNS (gaierror)

@@ -5,6 +5,7 @@
 
 import asyncio
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -317,6 +318,147 @@ class LoggerErrorsCase(unittest.IsolatedAsyncioTestCase):
 		big = b'{"k": "' + b"v" * 600 + b'"}'
 		with mock.patch("nanoservices.pipeline.yaml.dump", side_effect=ValueError("bad")):
 			self.assertEqual(_format_logged_data(big, is_json=True), big.decode("utf-8"))
+
+
+class BackendNoTimeoutCase(unittest.IsolatedAsyncioTestCase):
+	async def test_default_is_no_timeout(self):
+		# решает клиент разрывом — по умолчанию ждём бесконечно
+		self.assertIsNone(HttpBackend("http://127.0.0.1:1")._connect_timeout)
+
+	async def test_explicit_timeout_still_enforced(self):
+		backend = HttpBackend("http://127.0.0.1:1", connect_timeout=0.05)
+
+		async def slow(*args, **kwargs):
+			await asyncio.sleep(30)
+			return object(), object()
+
+		with mock.patch("asyncio.open_connection", side_effect=slow):
+			with self.assertRaises(NetworkError):
+				await backend._aopen_connection()
+
+	async def test_none_timeout_waits(self):
+		backend = HttpBackend("http://127.0.0.1:1")
+
+		async def slow_ok(*args, **kwargs):
+			await asyncio.sleep(0.3)  # дольше любого бывшего лимита — не должно резать
+			return object(), object()
+
+		with mock.patch("asyncio.open_connection", side_effect=slow_ok):
+			conn = await asyncio.wait_for(backend._aopen_connection(), 10)
+		self.assertIsNotNone(conn)
+
+
+class FirstHangsHandler(Handler):
+	"""Первый запрос висит вечно, остальные — сразу 200."""
+
+	def __init__(self):
+		self.calls = 0
+		self.entered = asyncio.Event()
+		self.cancelled = asyncio.Event()
+
+	async def ahandle(self, request, body):
+		self.calls += 1
+		if self.calls == 1:
+			self.entered.set()
+			try:
+				await asyncio.sleep(3600)
+			except asyncio.CancelledError:
+				self.cancelled.set()
+				raise
+
+		async def afread_response():
+			yield b"hi"
+
+		return ResponseInfo(status=200, reason="OK", headers=[("Content-Length", "2")]), afread_response
+
+
+class ClientAbortCase(unittest.IsolatedAsyncioTestCase):
+	async def test_client_close_aborts_backend_wait(self):
+		handler = FirstHangsHandler()
+		server = HttpServer(handler, host="127.0.0.1", port=0)
+		await server.astart()
+		port = server._server.sockets[0].getsockname()[1]
+
+		async def _aclose():
+			await asyncio.wait_for(server.aclose(), 10)
+
+		self.addAsyncCleanup(_aclose)
+
+		reader, writer = await asyncio.open_connection("127.0.0.1", port)
+		self.addCleanup(writer.close)
+		writer.write(b"GET /hang HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+		await writer.drain()
+		await asyncio.wait_for(handler.entered.wait(), 10)
+		writer.close()  # клиент решил прервать — без всяких таймаутов
+		await asyncio.wait_for(handler.cancelled.wait(), 10)
+
+		# сервер жив: следующий запрос обслуживается
+		reader2, writer2 = await asyncio.open_connection("127.0.0.1", port)
+		self.addCleanup(writer2.close)
+		writer2.write(b"GET /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+		await writer2.drain()
+		head = await asyncio.wait_for(reader2.readuntil(b"\r\n\r\n"), 10)
+		self.assertIn("200", head.split(b"\r\n")[0].decode())
+		body = await asyncio.wait_for(reader2.readexactly(2), 10)
+		self.assertEqual(body, b"hi")
+		writer2.close()
+
+
+class ClientWatchCase(unittest.IsolatedAsyncioTestCase):
+	async def test_watcher_returns_on_peer_close(self):
+		s1, s2 = socket.socketpair()
+		try:
+			s1.setblocking(False)
+			s2.close()
+			await asyncio.wait_for(HttpServer._aclient_closed(s1), 10)
+		finally:
+			s1.close()
+
+	async def test_watcher_survives_live_socket(self):
+		s1, s2 = socket.socketpair()
+		try:
+			s1.setblocking(False)
+			s2.setblocking(False)
+			watch = asyncio.create_task(HttpServer._aclient_closed(s1))
+			await asyncio.sleep(0.1)
+			self.assertFalse(watch.done())  # жив — не срабатывает
+			watch.cancel()
+			await asyncio.gather(watch, return_exceptions=True)
+		finally:
+			s1.close()
+			s2.close()
+
+	async def test_transportsocket_has_no_recv_but_dup_peeks(self):
+		# Ловушка, в которую уже наступали: extra-info сокет — это
+		# asyncio.trsock.TransportSocket без recv; пикать надо через fromfd-dup.
+		seen = {}
+
+		async def handle(reader, writer):
+			await reader.readuntil(b"\r\n\r\n")  # как прод: запрос вычитан до пика
+			raw = writer.get_extra_info("socket")
+			seen["has_recv"] = hasattr(raw, "recv")
+			dup = socket.fromfd(raw.fileno(), raw.family, raw.type, raw.proto)
+			dup.setblocking(False)
+			try:
+				seen["peek"] = dup.recv(1, socket.MSG_PEEK)
+			except BlockingIOError:
+				seen["peek"] = None
+			finally:
+				dup.close()
+			writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+			await writer.drain()
+			writer.close()
+
+		srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+		port = srv.sockets[0].getsockname()[1]
+		async with srv:
+			reader, writer = await asyncio.open_connection("127.0.0.1", port)
+			writer.write(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+			await writer.drain()
+			await asyncio.wait_for(reader.read(-1), 10)
+			writer.close()
+		self.assertFalse(seen["has_recv"])
+		self.assertIsNone(seen["peek"])  # запрос вычитан — данных нет, соединение живо
 
 
 if __name__ == "__main__":

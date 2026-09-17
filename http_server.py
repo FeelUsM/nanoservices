@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from typing import Any, Optional
 
 from .http_common import (
@@ -50,7 +51,14 @@ class HttpServer:
 	Content-Type: text/event-stream, сервер считает, что от конвейера приходят ЧИСТЫЕ
 	полезные нагрузки сообщений, и сам навешивает SSE-обвязку: каждый чанк оборачивается
 	в 'data: ...\\n\\n', а в конце дописывается 'data: [DONE]\\n\\n'.
+
+	Таймаутов со стороны прокси нет: прерывать ожидание backend'а или нет — решает
+	клиент разрывом своего соединения. Пока handler работает, за клиентом следит
+	вотчер (_aclient_closed): MSG_PEEK замечает FIN, не потребляя байты, поэтому
+	pipelined-запросы целы. Уход клиента = NetworkError, глотается молча.
 	"""
+
+	_CLIENT_WATCH_POLL_SEC = 0.5
 
 	def __init__(self, pipeline: Handler, host: str = "0.0.0.0", port: int = 8000) -> None:
 		self._host = host
@@ -120,7 +128,9 @@ class HttpServer:
 		body = b"".join([chunk async for chunk in afread_body(reader, headers, allow_until_close=False)])
 
 		try:
-			response, afread_response = await self._handler.ahandle(request, body)
+			response, afread_response = await self._ahandle_with_client_watch(
+				writer, request, body
+			)
 		except (NetworkError, HttpProtocolError) as exc:
 			_LOG.warning("HttpServer: [%s] backend недоступен: %s", client_addr, exc)
 			await self._awrite_error(writer, 502, keep_alive=False)
@@ -151,6 +161,77 @@ class HttpServer:
 			return False
 
 		return keep_alive
+
+	# ------------------------------------------------- ожидание backend'а под присмотром
+
+	async def _ahandle_with_client_watch(
+		self, writer: asyncio.StreamWriter, request: RequestInfo, body: bytes
+	) -> tuple[ResponseInfo, AFReadChunk]:
+		"""Ждёт handler, но если клиент раньше закрыл соединение — бросает работу.
+
+		Гонка handler против вотчера: кто первый, тот и решает. Уход клиента =
+		NetworkError (молча глотается в _ahandle_connection). Отмена handler'а
+		корректно освобождает его ресурсы (лок backend'а отдаётся через
+		except BaseException, вложенные генераторы — через await aclose в finally).
+
+		Важно: writer.get_extra_info("socket") — это asyncio.trsock.TransportSocket,
+		у него нет recv. Поэтому пикаем через dup настоящего сокета (fromfd):
+		дубликат делит соединение, peek ничего не потребляет, close(dup) рвет
+		только дубликат.
+		"""
+		raw = writer.get_extra_info("socket")
+		if raw is None:
+			return await self._handler.ahandle(request, body)
+		try:
+			dup = socket.fromfd(raw.fileno(), raw.family, raw.type, raw.proto)
+		except OSError:
+			return await self._handler.ahandle(request, body)
+		dup.setblocking(False)
+		try:
+			return await self._arace_handler_with_watch(dup, request, body)
+		finally:
+			dup.close()
+
+	async def _arace_handler_with_watch(
+		self, sock: socket.socket, request: RequestInfo, body: bytes
+	) -> tuple[ResponseInfo, AFReadChunk]:
+		handler_task = asyncio.create_task(self._handler.ahandle(request, body))
+		watch_task = asyncio.create_task(self._aclient_closed(sock))
+		try:
+			done, _ = await asyncio.wait(
+				{handler_task, watch_task}, return_when=asyncio.FIRST_COMPLETED
+			)
+		except asyncio.CancelledError:
+			handler_task.cancel()
+			watch_task.cancel()
+			await asyncio.gather(handler_task, watch_task, return_exceptions=True)
+			raise
+		if handler_task in done:
+			watch_task.cancel()
+			await asyncio.gather(watch_task, return_exceptions=True)
+			return handler_task.result()
+		handler_task.cancel()
+		await asyncio.gather(handler_task, watch_task, return_exceptions=True)
+		raise NetworkError("клиент закрыл соединение во время ожидания backend'а")
+
+	@staticmethod
+	async def _aclient_closed(sock: socket.socket) -> None:
+		"""Возвращается, когда пир закрыл соединение. Иначе висит (отменяется снаружи).
+
+		Только MSG_PEEK: байты не потребляются, pipelined-запросы целы. Сокет
+		неблокирующий (его ведёт asyncio), поэтому отсутствие данных — это
+		BlockingIOError, а не блокировка цикла.
+		"""
+		while True:
+			try:
+				peek = sock.recv(1, socket.MSG_PEEK)
+			except BlockingIOError:
+				peek = None  # данных нет — соединение живо
+			except OSError:
+				return  # сокет мёртв — считаем клиента ушедшим
+			if peek == b"":
+				return  # FIN от клиента
+			await asyncio.sleep(HttpServer._CLIENT_WATCH_POLL_SEC)
 
 	# ------------------------------------------------------------------ запись ответа
 

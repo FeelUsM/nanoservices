@@ -19,7 +19,7 @@
 - Префиксы: `a` — async-функции/методы (`ahandle`, `aclose`, `aserve_forever`), `af` — async-генераторы (`afread_response`, `afread_body`). Синхронные типы и функции префиксов не носят (`Handler`, `RequestInfo`, `parse_headers_block`). Неправильный префикс — ошибка нейминга, см. `pipeline.py:6-9` и `prompts.md:67`.
 
 ## Конструкторы
-- `HttpBackend(url)`: схема http/https, порт по умолчанию 80/443, префикс пути приклеивается перед путём запроса (`_target_path`), query склеиваются. `https` без явного `ssl_ctx` → `ssl.create_default_context()`. Парсер — `parse_target_url`.
+- `HttpBackend(url)`: схема http/https, порт по умолчанию 80/443, префикс пути приклеивается перед путём запроса (`_target_path`), query склеиваются. `https` без явного `ssl_ctx` → `ssl.create_default_context()`. Парсер — `parse_target_url`. `connect_timeout=None` — таймаутов нет, решает клиент (см. методику).
 - `StreamLogger(backend, dir, max_files)`: файловый логгер (см. ниже). Четвёртый keyword-only `log=print` — только для подмены консольного вывода.
 - `HttpServer(pipeline, host="0.0.0.0", port=8000)`: первый аргумент — конвейер.
 - Композиция: `HttpServer(StreamLogger(HttpBackend(url), dir, max_files))`, см. `example_proxy.py`.
@@ -62,7 +62,12 @@
 
 ## Ошибки и их обработка (методика)
 - Три класса ошибок: сеть → `NetworkError`, протокол → `HttpProtocolError`, всё остальное (баги, диск, `LogError`, `ValueError`, `NotImplementedError`) → внутренняя ошибка.
-- Заворот сырых исключений — на границе чтения/коннекта, как в правильных прокси: `(ConnectionError, OSError)` (включая `ConnectionResetError` при TLS-handshake, `ssl.SSLError`, `gaierror`, таймауты `wait_for`) → `NetworkError`; `LimitOverrunError`/oversize → `HttpProtocolError`. Сырой `OSError`/`TimeoutError` от чужого handler'а сервер тоже маппит в `502`/`504`, а не в `500`.
+- Таймаутов со стороны прокси НЕТ — прерывать или нет решает клиент разрывом своего соединения. `connect_timeout` в `HttpBackend` по умолчанию `None` (опция на крайний случай). Явный `TimeoutError` от чужого handler'а сервер всё равно маппит в `504`, а не в `500`.
+- Пока handler ждёт backend, за клиентом следит вотчер (`_aclient_closed`): `MSG_PEEK` замечает `FIN`, байты не потребляет (pipelined-запросы целы), опрос каждые `_CLIENT_WATCH_POLL_SEC`. Уход клиента = отмена handler'а + `NetworkError` (молча). Гонка через `asyncio.wait(FIRST_COMPLETED)`: успел handler — его результат важнее.
+- Ловушка вотчера: `writer.get_extra_info("socket")` — это `TransportSocket` БЕЗ `recv` (иначе вотчер мгновенно умирал и отменял каждый запрос — было). Пикать только через `socket.fromfd`-дубликат (`setblocking(False)`, `close` рвёт лишь дубликат). Тест-фиксатор в `test_errors.py`.
+- Закрывать соединение с непрочитанными данными в буфере нельзя — ядро шлёт `RST` вместо `FIN` (клиент получает `ConnectionResetError` вместо ответа). Поэтому запрос всегда вычитывается целиком ДО гонки/ответа — было, чинилось в тесте.
+- Честное ограничение: вотчер покрывает фазу ожидания ответа (коннект+заголовки). Если backend завис ПОСРЕДИ стрима тела, а клиент ушёл молча — заметим только на следующем чанке/записи. Лечится лишь таймаутом, которого по решению нет.
+- Заворот сырых исключений — на границе чтения/коннекта, как в правильных прокси: `(ConnectionError, OSError)` (включая `ConnectionResetError` при TLS-handshake, `ssl.SSLError`, `gaierror`) → `NetworkError`; `LimitOverrunError`/oversize → `HttpProtocolError`. Сырой `OSError` от чужого handler'а сервер тоже маппит в `502`, а не в `500`.
 - SSE-разбор — это формат: обрыв транспорта внутри `afdecode_sse` → `NetworkError`, нарушение формата → `HttpProtocolError`.
 - `HttpServer`: `NetworkError`/`HttpProtocolError`/сырой `OSError` → `502`, сырой `TimeoutError` → `504`, прочее → `500`. Ошибки чтения запроса от клиента — вне маппинга в статус: `NetworkError` → silent, остальное → лог без ответа.
 - `HttpBackend`: одна прозрачная переподключалка при `NetworkError` на протухшем keep-alive; ошибки `_aopen_connection` сразу в `NetworkError` без ретрая вслепую. Любой обрыв тела ответа (включая сырой `OSError`) → `reusable=False`/`drop`, битое соединение в пул не возвращается.
