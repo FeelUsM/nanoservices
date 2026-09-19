@@ -1,4 +1,5 @@
 import json
+import secrets
 import time
 from ..pipeline import Handler, RequestInfo
 
@@ -40,30 +41,58 @@ class OpencodeWrapper(Handler):
 		self.body = body
 
 	async def ahandle(self, request: RequestInfo, body: bytes):
+		# Заголовки: чужие форвардим как есть, свои (newh) — подменяем/дописываем.
+		# Сравнение регистронезависимо, иначе Authorization/Content-Type терялись.
+		newh_lower = {str(k).lower(): (k, v) for k, v in self.newh.items()}
+		if isinstance(self.delh, dict):
+			del_names = self.delh.keys()
+		else:
+			del_names = self.delh
+		del_lower = {str(k).lower() for k in del_names}
 		new_headers = []
 		done = set()
-		for k,v in request.headers:
-			if k in self.delh:        continue
-			if k in self.newh:
-				v = self.newh[k]
-				done.add(k)
-				if type(v) is str:    new_headers.append((k,v))
-				else:                 new_headers.append((k,v()))
-		for k,v in self.newh.items():
-			if k in done:         continue
-			if type(v) is str:    new_headers.append((k,v))
-			else:                 new_headers.append((k,v()))
+		for k, v in request.headers:
+			lk = str(k).lower()
+			if lk in del_lower:
+				continue
+			if lk in newh_lower:
+				canon, nv = newh_lower[lk]
+				done.add(lk)
+				if isinstance(nv, str):
+					new_headers.append((canon, nv))
+				else:
+					new_headers.append((canon, nv()))
+			else:
+				new_headers.append((k, v))
+		for lk, (canon, nv) in newh_lower.items():
+			if lk in done:
+				continue
+			if isinstance(nv, str):
+				new_headers.append((canon, nv))
+			else:
+				new_headers.append((canon, nv()))
 		request.headers = new_headers
 
-		body = json.loads(body.decode())
-		for k,v in self.body.items():
-			if k not in body: body[k] = v
+		try:
+			parsed = json.loads(body.decode())
+		except Exception:
+			# не-JSON (GET, пустое тело и т.п.) — форвардим как есть
+			return await self.backend.ahandle(request, body)
+		if not isinstance(parsed, dict):
+			return await self.backend.ahandle(request, body)
+		body = parsed
+		for k, v in self.body.items():
+			if k not in body:
+				body[k] = v
 
 		tools = set()
-		if "tools" not in body: body["tools"] = []
+		if not isinstance(body.get("tools"), list):
+			body["tools"] = []
 		for tool in body["tools"]:
-			if tool.get("type") == "function":
-				tools.add(tool.get("function",{"name":None}).get("name"))
+			if isinstance(tool, dict) and tool.get("type") == "function":
+				fn = tool.get("function", {})
+				if isinstance(fn, dict):
+					tools.add(fn.get("name"))
 		for tool in self.tools:
 			if tool not in tools:
 				body["tools"].append({"type": "function", "function": {"name": tool, "description": "Don't use this tool."}})
