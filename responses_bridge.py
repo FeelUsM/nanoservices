@@ -34,7 +34,8 @@ def _make_id(prefix: str) -> str:
 
 def _error_body(message: str) -> bytes:
 	return json.dumps(
-		{"error": {"message": message, "type": "invalid_request_error", "code": "invalid_request_error"}}
+		{"error": {"message": message, "type": "invalid_request_error", "code": "invalid_request_error"}},
+		ensure_ascii=False,
 	).encode()
 
 
@@ -133,7 +134,7 @@ def _input_to_messages(payload_input: Any, instructions: Any) -> list[dict]:
 				continue
 			args = item.get("arguments", "{}")
 			if not isinstance(args, str):
-				args = json.dumps(args)
+				args = json.dumps(args, ensure_ascii=False)
 			pending_calls.append(
 				{"id": str(call_id), "type": "function", "function": {"name": str(name), "arguments": args}}
 			)
@@ -393,7 +394,7 @@ class ResponsesBridge(Handler):
 			client_addr=request.client_addr,
 		)
 		print(f"ResponsesBridge: {request.method} {request.path} -> {chat_path} (stream={stream})")
-		response, afread_backend = await self._next.ahandle(fwd, json.dumps(chat_req).encode())
+		response, afread_backend = await self._next.ahandle(fwd, json.dumps(chat_req, ensure_ascii=False).encode())
 		if response.status != 200 or not stream:
 			if response.status != 200:
 				return response, afread_backend
@@ -445,7 +446,7 @@ class ResponsesBridge(Handler):
 			if message.get("tool_calls"):
 				assistant_msg["tool_calls"] = message["tool_calls"]
 			self._store_session(resp_id, combined + [assistant_msg])
-		body = json.dumps(resp).encode()
+		body = json.dumps(resp, ensure_ascii=False).encode()
 		async def afread_json() -> AsyncIterator[bytes]:
 			yield body
 		return ResponseInfo(status=200, reason="OK", headers=[("Content-Type", "application/json")]), afread_json
@@ -460,7 +461,7 @@ class ResponsesBridge(Handler):
 		msg_id = _make_id("msg_")
 
 		def ev(event: dict) -> bytes:
-			return json.dumps(event).encode()
+			return json.dumps(event, ensure_ascii=False).encode()
 
 		async def afread_response() -> AsyncIterator[bytes]:
 			full_text = ""

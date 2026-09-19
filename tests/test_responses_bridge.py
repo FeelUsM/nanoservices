@@ -284,6 +284,18 @@ class BridgeCase(unittest.IsolatedAsyncioTestCase):
 		self.assertEqual(done["usage"], {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12})
 		self.assertIn(done["id"], bridge._sessions)
 
+	async def test_nonascii_readable_no_unicode_escapes(self):
+		chat = dict(CHAT_OK)
+		chat["choices"] = [{"index": 0, "message": {"role": "assistant", "content": "Привет! 👋"},
+			"finish_reason": "stop"}]
+		stub = StubBackend(chunks=[json.dumps(chat, ensure_ascii=False).encode()])
+		bridge = ResponsesBridge(stub)
+		_, factory = await bridge.ahandle(arequest("/v1/responses"),
+			json.dumps({"model": "m", "input": "hi"}).encode())
+		raw = (await acollected(factory)).decode()
+		self.assertIn("Привет! 👋", raw)
+		self.assertNotIn("\\u", raw)
+
 	async def _astream_all(self, factory):
 		gen = factory()
 		out = []
