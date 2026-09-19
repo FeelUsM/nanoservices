@@ -13,6 +13,7 @@ import logging
 from .http_backend import HttpBackend
 from .http_server import HttpServer
 from .pipeline import StreamLogger
+from.opencode.wrapper import OpencodeWrapper
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,8 +31,9 @@ async def amain() -> None:
 	args = parse_args()
 
 	backend = HttpBackend(args.url)
-	pipeline = StreamLogger(backend, args.dir, args.max_files, log=logging.getLogger("proxy").info)
-	server = HttpServer(pipeline, host=args.host, port=args.port)
+	logger = StreamLogger(backend, args.dir, args.max_files, log=logging.getLogger("proxy").info)
+	wrapper = OpencodeWrapper(logger)
+	server = HttpServer(wrapper, host=args.host, port=args.port)
 
 	try:
 		await server.aserve_forever()
